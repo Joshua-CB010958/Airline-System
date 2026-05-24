@@ -92,6 +92,13 @@ def get_flight(flight_id: str) -> dict:
     if response.status_code == 404:
         raise HTTPException(status_code=404, detail=f"Flight '{flight_id}' not found.")
 
+    # 422 means the flight_id value failed validation on the Flight Service side
+    if response.status_code == 422:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid flight_id '{flight_id}'. Check the Flight Service for valid IDs (GET /flights).",
+        )
+
     if response.status_code != 200:
         raise HTTPException(
             status_code=502,
@@ -129,6 +136,23 @@ def decrement_seat(flight_id: str) -> None:
             status_code=502,
             detail=f"Failed to decrement seat count (HTTP {response.status_code}).",
         )
+
+
+def increment_seat(flight_id: str) -> None:
+    """
+    Call PATCH /flight/{id}/seat/restore on the Flight Service to add back
+    1 seat when a booking is cancelled. Failure is logged but does not block
+    the deletion — the booking is already removed from the local store.
+    """
+    url = f"{FLIGHT_SERVICE_URL}/flight/{flight_id}/seat/restore"
+    try:
+        response = requests.patch(url, timeout=5)
+        if response.status_code not in (200, 204):
+            # Non-fatal: booking is deleted; seat restore is best-effort
+            print(f"Warning: seat restore for flight '{flight_id}' returned HTTP {response.status_code}")
+    except requests.exceptions.RequestException as exc:
+        # Non-fatal: do not block the delete if Flight Service is unreachable
+        print(f"Warning: could not restore seat for flight '{flight_id}': {exc}")
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -212,3 +236,33 @@ def create_booking(payload: BookingRequest):
 
     # --- Step 6: Return the created booking ---
     return new_booking
+
+
+@app.delete("/booking/{id}", status_code=200, tags=["Bookings"])
+def delete_booking(id: str):
+    """
+    Cancel and delete a booking by ID.
+
+    Deletion logic:
+      1. Look up the booking — return 404 if it does not exist.
+      2. Remove the booking from the in-memory store.
+      3. Attempt to restore the seat count on the Flight Service (best-effort).
+         If the Flight Service is unavailable the booking is still deleted locally.
+      4. Return a confirmation message with HTTP 200.
+    """
+    # --- Step 1: Check booking exists ---
+    booking = bookings_db.get(id)
+    if not booking:
+        raise HTTPException(status_code=404, detail=f"Booking '{id}' not found.")
+
+    flight_id = booking["flight_id"]
+
+    # --- Step 2: Remove booking from store ---
+    del bookings_db[id]
+
+    # --- Step 3: Restore the seat on the Flight Service ---
+    # Best-effort: a warning is printed if this fails, but the delete still succeeds.
+    increment_seat(flight_id)
+
+    # --- Step 4: Confirm deletion ---
+    return {"message": f"Booking '{id}' has been cancelled successfully."}
