@@ -1,45 +1,69 @@
 """
-Booking Service - FastAPI Microservice
-Handles flight bookings and communicates with the Flight Service
-for seat availability checks and seat count management.
+Booking Service — FastAPI Microservice
+──────────────────────────────────────
+Manages flight bookings and coordinates with the Flight Service for seat
+availability checks and seat count management.
+
+Phase 4 Security
+────────────────
+All endpoints are protected with JWT authentication via the shared auth module.
+Service-to-service calls to the Flight Service forward the caller's Bearer token
+so that the Flight Service can independently verify the request (zero-trust).
+
+Role matrix:
+  GET  /bookings          — passenger, staff, admin
+  GET  /booking/{id}      — passenger, staff, admin
+  POST /booking           — passenger, staff, admin
+  DELETE /booking/{id}    — staff, admin only
 """
 
 import os
 import uuid
-from typing import Optional
 from datetime import datetime
+from typing import Optional
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+from .auth import get_current_user, require_roles
 
-# Flight Service base URL — override via environment variable in Docker/K8s
+# ── Configuration ──────────────────────────────────────────────────────────────
+# Override via environment variable when running in Docker / Kubernetes.
 FLIGHT_SERVICE_URL = os.getenv("FLIGHT_SERVICE_URL", "http://host.docker.internal:8000")
 
-# ---------------------------------------------------------------------------
-# FastAPI app initialisation
-# ---------------------------------------------------------------------------
+# ── FastAPI Application ────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Booking Service",
-    description="Microservice for managing flight bookings in a distributed airline system.",
+    description="""
+## Booking Microservice
+
+Part of the Distributed Airline Management System.
+
+### Authentication
+All endpoints require a valid **JWT Bearer token** issued by the
+**Auth Service** running on port 8003.
+
+1. Obtain a token: `POST http://localhost:8003/login`
+2. Click **Authorize** (top-right) and enter: `Bearer <your_token>`
+
+### Role permissions
+| Endpoint              | passenger | staff | admin |
+|-----------------------|:---------:|:-----:|:-----:|
+| GET /bookings         | ✓         | ✓     | ✓     |
+| GET /booking/{id}     | ✓         | ✓     | ✓     |
+| POST /booking         | ✓         | ✓     | ✓     |
+| DELETE /booking/{id}  |           | ✓     | ✓     |
+""",
     version="1.0.0",
 )
 
-# ---------------------------------------------------------------------------
-# In-memory data store
-# ---------------------------------------------------------------------------
-
-# Mock booking store: { booking_id (str) -> booking dict }
+# ── In-Memory Store ────────────────────────────────────────────────────────────
 bookings_db: dict[str, dict] = {}
 
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
+
+# ── Pydantic Models ────────────────────────────────────────────────────────────
 
 class BookingRequest(BaseModel):
     """Fields required to create a new booking."""
@@ -50,7 +74,7 @@ class BookingRequest(BaseModel):
 
 
 class BookingResponse(BaseModel):
-    """Shape of a booking returned by the API."""
+    """Shape of a booking record returned by the API."""
     id: str
     flight_id: str
     passenger_name: str
@@ -61,163 +85,220 @@ class BookingResponse(BaseModel):
 
 
 class ServiceStatus(BaseModel):
-    """Root endpoint response."""
     service: str
     status: str
 
-# ---------------------------------------------------------------------------
-# Helper — Flight Service communication
-# ---------------------------------------------------------------------------
 
-def get_flight(flight_id: str) -> dict:
+# ── Service-to-Service Authorization ──────────────────────────────────────────
+# When booking-service calls flight-service, it forwards the original caller's
+# Bearer token. Flight-service then independently verifies that same JWT.
+# This is the token-forwarding pattern for service-to-service auth in HS256.
+
+def _forward_auth(request: Request) -> dict:
+    """
+    Extract the incoming Authorization header to forward to downstream services.
+    Returns a headers dict ready to pass to requests.get() / requests.patch().
+    """
+    auth_header = request.headers.get("Authorization", "")
+    return {"Authorization": auth_header}
+
+
+def get_flight(flight_id: str, auth_headers: dict) -> dict:
     """
     Fetch flight details from the Flight Service.
-    Raises HTTPException if the service is unreachable or the flight is not found.
+
+    Service-to-service call: forwards the caller's Bearer token so that
+    the Flight Service can verify auth independently.
+    Raises HTTPException on network failure, 401, 404, or other errors.
     """
     url = f"{FLIGHT_SERVICE_URL}/flight/{flight_id}"
     try:
-        response = requests.get(url, timeout=5)
+        response = requests.get(url, headers=auth_headers, timeout=5)
     except requests.exceptions.ConnectionError:
-        # Flight Service is down or unreachable
         raise HTTPException(
-            status_code=503,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Flight Service is unavailable. Please try again later.",
         )
     except requests.exceptions.Timeout:
         raise HTTPException(
-            status_code=504,
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail="Flight Service did not respond in time.",
         )
 
+    if response.status_code == 401:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Service-to-service auth failed: token rejected by Flight Service.",
+        )
+    if response.status_code == 403:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Service-to-service auth failed: insufficient role for Flight Service.",
+        )
     if response.status_code == 404:
-        raise HTTPException(status_code=404, detail=f"Flight '{flight_id}' not found.")
-
-    # 422 means the flight_id value failed validation on the Flight Service side
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Flight '{flight_id}' not found.",
+        )
     if response.status_code == 422:
         raise HTTPException(
-            status_code=422,
-            detail=f"Invalid flight_id '{flight_id}'. Check the Flight Service for valid IDs (GET /flights).",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid flight_id '{flight_id}'. Check GET /flights for valid IDs.",
         )
-
     if response.status_code != 200:
         raise HTTPException(
-            status_code=502,
+            status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Flight Service returned an unexpected error (HTTP {response.status_code}).",
         )
 
     return response.json()
 
 
-def decrement_seat(flight_id: str) -> None:
+def decrement_seat(flight_id: str, auth_headers: dict) -> None:
     """
-    Call PATCH /flight/{id}/seat on the Flight Service to reduce the
-    available seat count by 1 after a successful booking.
-    Raises HTTPException if the operation fails.
+    Decrease the available seat count by 1 on the Flight Service.
+
+    Service-to-service call: forwards the caller's Bearer token.
+    Called after a booking is successfully persisted.
     """
     url = f"{FLIGHT_SERVICE_URL}/flight/{flight_id}/seat"
     try:
-        response = requests.patch(url, timeout=5)
+        response = requests.patch(url, headers=auth_headers, timeout=5)
     except requests.exceptions.ConnectionError:
         raise HTTPException(
-            status_code=503,
-            detail="Flight Service is unavailable. Seat count could not be decremented.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Flight Service unavailable during seat decrement.",
         )
     except requests.exceptions.Timeout:
         raise HTTPException(
-            status_code=504,
-            detail="Flight Service timed out while decrementing seat count.",
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Flight Service timed out during seat decrement.",
         )
 
+    if response.status_code == 401:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Service-to-service auth failed during seat decrement.",
+        )
+    if response.status_code == 403:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient role for seat decrement on Flight Service.",
+        )
     if response.status_code == 404:
-        raise HTTPException(status_code=404, detail=f"Flight '{flight_id}' not found during seat update.")
-
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Flight '{flight_id}' not found during seat update.",
+        )
     if response.status_code not in (200, 204):
         raise HTTPException(
-            status_code=502,
+            status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Failed to decrement seat count (HTTP {response.status_code}).",
         )
 
 
-def increment_seat(flight_id: str) -> None:
+def increment_seat(flight_id: str, auth_headers: dict) -> None:
     """
-    Call PATCH /flight/{id}/seat/restore on the Flight Service to add back
-    1 seat when a booking is cancelled. Failure is logged but does not block
-    the deletion — the booking is already removed from the local store.
+    Restore the seat count by 1 on the Flight Service when a booking is cancelled.
+
+    Service-to-service call: forwards the caller's Bearer token.
+    Best-effort: a warning is logged on failure but the booking deletion still succeeds.
     """
     url = f"{FLIGHT_SERVICE_URL}/flight/{flight_id}/seat/restore"
     try:
-        response = requests.patch(url, timeout=5)
+        response = requests.patch(url, headers=auth_headers, timeout=5)
         if response.status_code not in (200, 204):
-            # Non-fatal: booking is deleted; seat restore is best-effort
-            print(f"Warning: seat restore for flight '{flight_id}' returned HTTP {response.status_code}")
+            print(
+                f"[booking-service] Warning: seat restore for flight '{flight_id}' "
+                f"returned HTTP {response.status_code}"
+            )
     except requests.exceptions.RequestException as exc:
-        # Non-fatal: do not block the delete if Flight Service is unreachable
-        print(f"Warning: could not restore seat for flight '{flight_id}': {exc}")
+        print(f"[booking-service] Warning: could not restore seat for flight '{flight_id}': {exc}")
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+
+# ── Public Endpoints ───────────────────────────────────────────────────────────
 
 @app.get("/", response_model=ServiceStatus, tags=["Health"])
 def root():
-    """Root health-check endpoint."""
+    """Public health-check endpoint — no authentication required."""
     return {"service": "Booking Service", "status": "running"}
 
 
-@app.get("/bookings", response_model=list[BookingResponse], tags=["Bookings"])
+# ── Protected Endpoints — all authenticated roles ──────────────────────────────
+
+@app.get("/bookings", response_model=list[BookingResponse], tags=["Bookings"],
+         dependencies=[Depends(get_current_user)])
 def get_all_bookings():
-    """Return a list of all bookings stored in memory."""
+    """
+    List all bookings.
+
+    **Authentication:** Requires a valid JWT Bearer token.
+    **Roles allowed:** passenger, staff, admin.
+    Returns HTTP 401 if the token is missing or invalid.
+    """
     return list(bookings_db.values())
 
 
-@app.get("/booking/{id}", response_model=BookingResponse, tags=["Bookings"])
+@app.get("/booking/{id}", response_model=BookingResponse, tags=["Bookings"],
+         dependencies=[Depends(get_current_user)])
 def get_booking(id: str):
     """
-    Return a single booking by its ID.
-    Returns 404 if the booking does not exist.
+    Retrieve a single booking by ID.
+
+    **Authentication:** Requires a valid JWT Bearer token.
+    **Roles allowed:** passenger, staff, admin.
+    Returns HTTP 401 if token is missing/invalid, HTTP 404 if booking not found.
     """
     booking = bookings_db.get(id)
     if not booking:
-        raise HTTPException(status_code=404, detail=f"Booking '{id}' not found.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Booking '{id}' not found.",
+        )
     return booking
 
 
-@app.post("/booking", response_model=BookingResponse, status_code=201, tags=["Bookings"])
-def create_booking(payload: BookingRequest):
+@app.post("/booking", response_model=BookingResponse, status_code=201, tags=["Bookings"],
+          dependencies=[Depends(require_roles(["passenger", "staff", "admin"]))])
+def create_booking(payload: BookingRequest, request: Request):
     """
     Create a new flight booking.
 
-    Booking creation logic:
-      1. Validate all required fields via Pydantic (automatic).
-      2. Check seat availability by calling GET /flight/{id} on the Flight Service.
-      3. If available_seats <= 0, return HTTP 409 (Conflict) — no seats left.
-      4. If seats are available, persist the booking in memory.
-      5. Decrement the seat count on the Flight Service via PATCH /flight/{id}/seat.
-      6. Return the created booking with HTTP 201.
-    """
+    **Authentication:** Requires a valid JWT Bearer token.
+    **Roles allowed:** passenger, staff, admin.
 
-    # --- Step 1: Validate seat_class value ---
+    **Service-to-service flow:**
+    The caller's Bearer token is forwarded to the Flight Service for all
+    downstream calls, so the Flight Service independently verifies auth.
+
+    **Booking logic:**
+    1. Validate seat_class value.
+    2. Call Flight Service (GET /flight/{id}) — forwarding token — to check availability.
+    3. Reject with HTTP 409 if no seats remain.
+    4. Persist the booking in memory.
+    5. Call Flight Service (PATCH /flight/{id}/seat) — forwarding token — to decrement seat.
+    6. Return the created booking (HTTP 201).
+    """
+    # Step 1: Validate seat class
     valid_classes = {"economy", "business", "first"}
     if payload.seat_class not in valid_classes:
         raise HTTPException(
-            status_code=422,
-            detail=f"Invalid seat_class '{payload.seat_class}'. Must be one of: {', '.join(valid_classes)}.",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid seat_class '{payload.seat_class}'. Must be one of: {sorted(valid_classes)}.",
         )
 
-    # --- Step 2: Flight availability check ---
-    # Query the Flight Service to confirm the flight exists and has open seats.
-    flight = get_flight(payload.flight_id)
+    # Extract header once; reuse for all downstream calls
+    auth_headers = _forward_auth(request)
 
-    available_seats = flight.get("available_seats", 0)
-
-    # --- Step 3: Reject booking if no seats remain ---
-    if available_seats <= 0:
+    # Step 2: Verify flight exists and has open seats (token forwarded)
+    flight = get_flight(payload.flight_id, auth_headers)
+    if flight.get("available_seats", 0) <= 0:
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail=f"No seats available on flight '{payload.flight_id}'.",
         )
 
-    # --- Step 4: Persist the new booking ---
+    # Step 3: Persist booking
     booking_id = str(uuid.uuid4())
     new_booking = {
         "id": booking_id,
@@ -230,39 +311,43 @@ def create_booking(payload: BookingRequest):
     }
     bookings_db[booking_id] = new_booking
 
-    # --- Step 5: Decrement seat count on the Flight Service ---
-    # This keeps the flight's available_seats in sync with confirmed bookings.
-    decrement_seat(payload.flight_id)
+    # Step 4: Decrement seat count on Flight Service (token forwarded)
+    decrement_seat(payload.flight_id, auth_headers)
 
-    # --- Step 6: Return the created booking ---
     return new_booking
 
 
-@app.delete("/booking/{id}", status_code=200, tags=["Bookings"])
-def delete_booking(id: str):
+# ── Protected Endpoints — staff / admin only ───────────────────────────────────
+
+@app.delete("/booking/{id}", status_code=200, tags=["Bookings"],
+            dependencies=[Depends(require_roles(["staff", "admin"]))])
+def delete_booking(id: str, request: Request):
     """
     Cancel and delete a booking by ID.
 
-    Deletion logic:
-      1. Look up the booking — return 404 if it does not exist.
-      2. Remove the booking from the in-memory store.
-      3. Attempt to restore the seat count on the Flight Service (best-effort).
-         If the Flight Service is unavailable the booking is still deleted locally.
-      4. Return a confirmation message with HTTP 200.
+    **Authentication:** Requires a valid JWT Bearer token.
+    **Roles allowed:** staff, admin only.
+    Returns HTTP 403 if a passenger attempts this action.
+
+    **Deletion logic:**
+    1. Look up booking — return HTTP 404 if not found.
+    2. Remove booking from store.
+    3. Call Flight Service (PATCH /flight/{id}/seat/restore) — forwarding token —
+       to restore the freed seat (best-effort; booking is deleted even if this fails).
     """
-    # --- Step 1: Check booking exists ---
     booking = bookings_db.get(id)
     if not booking:
-        raise HTTPException(status_code=404, detail=f"Booking '{id}' not found.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Booking '{id}' not found.",
+        )
 
     flight_id = booking["flight_id"]
 
-    # --- Step 2: Remove booking from store ---
+    # Remove booking first so the response is consistent even if seat restore fails
     del bookings_db[id]
 
-    # --- Step 3: Restore the seat on the Flight Service ---
-    # Best-effort: a warning is printed if this fails, but the delete still succeeds.
-    increment_seat(flight_id)
+    # Best-effort seat restore — logs a warning on failure, does not block response
+    increment_seat(flight_id, _forward_auth(request))
 
-    # --- Step 4: Confirm deletion ---
     return {"message": f"Booking '{id}' has been cancelled successfully."}
