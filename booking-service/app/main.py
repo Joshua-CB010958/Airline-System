@@ -10,6 +10,12 @@ All endpoints are protected with JWT authentication via the shared auth module.
 Service-to-service calls to the Flight Service forward the caller's Bearer token
 so that the Flight Service can independently verify the request (zero-trust).
 
+Phase 5 — Event Publishing
+──────────────────────────
+After a booking is successfully created the service publishes a JSON event to
+an Amazon SNS topic so that downstream consumers (e.g. notification, baggage
+services) can react without polling.
+
 Role matrix:
   GET  /bookings          — passenger, staff, admin
   GET  /booking/{id}      — passenger, staff, admin
@@ -17,20 +23,44 @@ Role matrix:
   DELETE /booking/{id}    — staff, admin only
 """
 
+import json
+import logging
 import os
 import uuid
 from datetime import datetime
 from typing import Optional
 
+import boto3
 import requests
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from .auth import get_current_user, require_roles
 
+logger = logging.getLogger(__name__)
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 # Override via environment variable when running in Docker / Kubernetes.
 FLIGHT_SERVICE_URL = os.getenv("FLIGHT_SERVICE_URL", "http://host.docker.internal:8000")
+
+# SNS topic that receives booking-created events.
+# Falls back to the project ARN if the environment variable is not set.
+SNS_TOPIC_ARN = os.getenv(
+    "SNS_TOPIC_ARN",
+    "arn:aws:sns:eu-west-1:180571023460:alms-booking-topic",
+)
+
+# AWS region — must match the region in the topic ARN.
+AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
+
+# ── SNS Client ─────────────────────────────────────────────────────────────────
+# Boto3 client is created once at startup; subsequent calls reuse the connection.
+# Credentials are resolved via the standard boto3 chain:
+#   1. Environment variables (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+#   2. ~/.aws/credentials
+#   3. IAM instance/task role (recommended for production)
+sns_client = boto3.client("sns", region_name=AWS_REGION)
 
 # ── FastAPI Application ────────────────────────────────────────────────────────
 
@@ -216,6 +246,78 @@ def increment_seat(flight_id: str, auth_headers: dict) -> None:
         print(f"[booking-service] Warning: could not restore seat for flight '{flight_id}': {exc}")
 
 
+# ── SNS Event Publisher ────────────────────────────────────────────────────────
+
+def publish_booking_event(booking: dict) -> None:
+    """
+    Publish a booking-created event to Amazon SNS.
+
+    Payload fields:
+      - booking_id      — unique identifier of the new booking
+      - passenger_name  — full name of the passenger
+      - flight_id       — the flight the passenger booked
+      - status          — booking status at publish time (always "confirmed" here)
+      - timestamp       — ISO 8601 UTC timestamp of when the event was emitted
+
+    The event is published *after* the booking has been persisted and the seat
+    count decremented, so downstream consumers can trust the record exists.
+
+    If the SNS publish call fails (network error, permission denied, invalid ARN,
+    etc.) the error is logged and an HTTP 503 is raised so the caller knows the
+    event was not delivered.  The booking itself has already been created at this
+    point, so the error response describes a partial failure.
+    """
+    # Build the event payload; only the fields consumers need to act on.
+    event_payload = {
+        "booking_id": booking["id"],
+        "passenger_name": booking["passenger_name"],
+        "flight_id": booking["flight_id"],
+        "status": booking["status"],
+        # ISO 8601 timestamp generated at publish time (not booking creation time).
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+    try:
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Message=json.dumps(event_payload),
+            Subject="booking.created",
+        )
+        logger.info(
+            "[booking-service] SNS event published for booking '%s' on flight '%s'.",
+            booking["id"],
+            booking["flight_id"],
+        )
+    except ClientError as exc:
+        # AWS returned an error response (e.g. AuthorizationError, InvalidParameter).
+        logger.error(
+            "[booking-service] SNS ClientError for booking '%s': %s",
+            booking["id"],
+            exc.response["Error"]["Message"],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Booking was created but the confirmation event could not be "
+                f"published to SNS: {exc.response['Error']['Message']}"
+            ),
+        )
+    except BotoCoreError as exc:
+        # Low-level boto3 error (e.g. network failure, endpoint unreachable).
+        logger.error(
+            "[booking-service] SNS BotoCoreError for booking '%s': %s",
+            booking["id"],
+            str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Booking was created but the confirmation event could not be "
+                f"published to SNS: {exc}"
+            ),
+        )
+
+
 # ── Public Endpoints ───────────────────────────────────────────────────────────
 
 @app.get("/", response_model=ServiceStatus, tags=["Health"])
@@ -277,7 +379,8 @@ def create_booking(payload: BookingRequest, request: Request):
     3. Reject with HTTP 409 if no seats remain.
     4. Persist the booking in memory.
     5. Call Flight Service (PATCH /flight/{id}/seat) — forwarding token — to decrement seat.
-    6. Return the created booking (HTTP 201).
+    6. Publish a booking-created event to Amazon SNS.
+    7. Return the created booking (HTTP 201).
     """
     # Step 1: Validate seat class
     valid_classes = {"economy", "business", "first"}
@@ -313,6 +416,11 @@ def create_booking(payload: BookingRequest, request: Request):
 
     # Step 4: Decrement seat count on Flight Service (token forwarded)
     decrement_seat(payload.flight_id, auth_headers)
+
+    # Step 5: Publish booking-created event to SNS.
+    # Only reached after the booking is persisted and the seat decremented.
+    # Raises HTTP 503 if the publish fails — see publish_booking_event() for details.
+    publish_booking_event(new_booking)
 
     return new_booking
 

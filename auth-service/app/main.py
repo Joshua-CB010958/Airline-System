@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -256,6 +257,17 @@ Part of the Distributed Airline Management System.
 | GET /admin/users      |           |       | ✓     |
 """,
     version="1.0.0",
+)
+
+# Allow Swagger UIs on other service ports (8000-8003) to call /login directly
+# from the browser when using the OAuth2 Authorize dialog. Without this the
+# browser blocks the cross-origin POST and Swagger shows "Failed to fetch".
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8000", "http://localhost:8001",
+                   "http://localhost:8002", "http://localhost:8003"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 

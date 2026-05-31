@@ -1,7 +1,7 @@
 """
 Baggage Service — FastAPI Microservice
 ───────────────────────────────────────
-Manages airline baggage records in the distributed airline management system.
+Manages airline baggage records stored in Amazon DynamoDB.
 
 Phase 4 Security
 ────────────────
@@ -14,11 +14,37 @@ Role matrix:
   PATCH /baggage/update   — staff, admin only
 """
 
+import logging
+import os
+from decimal import Decimal
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
 from .auth import get_current_user, require_roles
+
+logger = logging.getLogger(__name__)
+
+# ── DynamoDB Setup ─────────────────────────────────────────────────────────────
+# Table name is read from the environment; falls back to 'dams_baggage' when
+# the variable is absent (local dev / CI without the env configured).
+BAGGAGE_TABLE_NAME = os.environ.get("DYNAMODB_BAGGAGE_TABLE", "dams_baggage")
+
+try:
+    # boto3.resource provides a high-level Table interface that handles
+    # attribute serialisation automatically (strings, Decimal numbers, etc.).
+    _dynamodb = boto3.resource(
+        "dynamodb",
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "eu-west-1"),
+    )
+    _table = _dynamodb.Table(BAGGAGE_TABLE_NAME)
+except Exception as exc:
+    logger.error("Failed to initialise DynamoDB resource: %s", exc)
+    raise RuntimeError(f"DynamoDB initialisation failed: {exc}") from exc
+
 
 # ── FastAPI Application ────────────────────────────────────────────────────────
 
@@ -65,31 +91,46 @@ class BaggageUpdateRequest(BaseModel):
     location: Optional[str] = Field(None, description="New physical location (optional)")
 
 
-# ── In-Memory Data Store ───────────────────────────────────────────────────────
+# ── DynamoDB Helpers ───────────────────────────────────────────────────────────
 
-baggage_db: List[dict] = [
-    {"id": 1, "passenger_name": "Josh Perera",        "flight_id": 1, "status": "Checked In",  "location": "Heathrow Airport"},
-    {"id": 2, "passenger_name": "Sarah Mendis",        "flight_id": 2, "status": "In Transit",  "location": "Dubai International Airport"},
-    {"id": 3, "passenger_name": "Amal Fernando",       "flight_id": 1, "status": "Arrived",     "location": "Bandaranaike International Airport"},
-    {"id": 4, "passenger_name": "Priya Jayawardena",   "flight_id": 3, "status": "Checked In",  "location": "Changi Airport"},
-    {"id": 5, "passenger_name": "Nimal Wickrama",      "flight_id": 2, "status": "Lost",        "location": "Unknown"},
-]
-
-
-# ── Helper ─────────────────────────────────────────────────────────────────────
-
-def _find_baggage(baggage_id: int) -> dict:
+def _deserialise(item: dict) -> dict:
     """
-    Scan the in-memory list for a record matching baggage_id.
-    Raises HTTP 404 if no match is found so callers never receive None.
+    Convert DynamoDB Decimal values back to plain Python ints.
+    DynamoDB returns all numbers as decimal.Decimal; Pydantic requires int
+    for the id and flight_id fields.
     """
-    for item in baggage_db:
-        if item["id"] == baggage_id:
-            return item
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Baggage item with ID {baggage_id} not found.",
-    )
+    return {
+        "id":             int(item["id"]),
+        "passenger_name": item["passenger_name"],
+        "flight_id":      int(item["flight_id"]),
+        "status":         item["status"],
+        "location":       item["location"],
+    }
+
+
+def _get_baggage_item(baggage_id: int) -> dict:
+    """
+    Fetch a single record from DynamoDB by primary key (id).
+    Raises HTTP 404 when the item does not exist.
+    Raises HTTP 503 on DynamoDB connectivity or permission errors.
+    """
+    try:
+        # GetItem is an O(1) key lookup — id is the partition key (Number type).
+        response = _table.get_item(Key={"id": baggage_id})
+    except (BotoCoreError, ClientError) as exc:
+        logger.error("DynamoDB GetItem failed for id=%s: %s", baggage_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Baggage database is temporarily unavailable.",
+        )
+
+    item = response.get("Item")
+    if item is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Baggage item with ID {baggage_id} not found.",
+        )
+    return _deserialise(item)
 
 
 # ── Public Endpoints ───────────────────────────────────────────────────────────
@@ -112,7 +153,19 @@ def get_all_baggage():
     **Roles allowed:** passenger, staff, admin.
     Returns HTTP 401 if the token is missing or invalid.
     """
-    return baggage_db
+    try:
+        # Scan reads every item in the table and is suitable for the small
+        # baggage dataset in this demo.  For large-scale production use a
+        # Query against a GSI instead.
+        response = _table.scan()
+    except (BotoCoreError, ClientError) as exc:
+        logger.error("DynamoDB Scan failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Baggage database is temporarily unavailable.",
+        )
+
+    return [_deserialise(item) for item in response.get("Items", [])]
 
 
 @app.get("/baggage/{id}", response_model=BaggageItem, tags=["Baggage"],
@@ -125,7 +178,7 @@ def get_baggage(id: int):
     **Roles allowed:** passenger, staff, admin.
     Returns HTTP 404 if the baggage item does not exist.
     """
-    return _find_baggage(id)
+    return _get_baggage_item(id)
 
 
 # ── Protected Endpoints — staff / admin only ───────────────────────────────────
@@ -147,11 +200,37 @@ def update_baggage(payload: BaggageUpdateRequest):
     4. Apply location update only when explicitly provided.
     5. Return the full updated record.
     """
-    record = _find_baggage(payload.baggage_id)
+    # Confirm the item exists before writing; raises 404 if not found.
+    _get_baggage_item(payload.baggage_id)
 
-    record["status"] = payload.status
+    # Build the UpdateExpression dynamically so that location is only written
+    # when the caller explicitly provides it; status is always updated.
+    update_expr = "SET #s = :status"
+    expr_names = {"#s": "status"}
+    expr_values: dict = {":status": payload.status}
 
     if payload.location is not None:
-        record["location"] = payload.location
+        update_expr += ", #l = :location"
+        expr_names["#l"] = "location"
+        expr_values[":location"] = payload.location
 
-    return record
+    try:
+        # UpdateItem writes only the changed attributes in-place; unchanged
+        # fields are untouched in DynamoDB.  ReturnValues="ALL_NEW" returns
+        # the complete record after the write so we can respond immediately.
+        response = _table.update_item(
+            Key={"id": payload.baggage_id},
+            UpdateExpression=update_expr,
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values,
+            ReturnValues="ALL_NEW",
+        )
+    except (BotoCoreError, ClientError) as exc:
+        logger.error("DynamoDB UpdateItem failed for id=%s: %s", payload.baggage_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Baggage database is temporarily unavailable.",
+        )
+
+    # Deserialise Decimal numbers before returning to Pydantic / FastAPI.
+    return _deserialise(response["Attributes"])

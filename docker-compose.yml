@@ -1,0 +1,74 @@
+# Airline Management System — docker-compose
+# ──────────────────────────────────────────
+# Starts all four microservices in the correct order.
+# Services share the "alms-network" bridge so they can reach each other
+# by service name (e.g. booking-service calls http://flight-service:8000).
+#
+# Usage:
+#   docker-compose up --build          # first run / after code changes
+#   docker-compose up                  # subsequent runs (uses cached images)
+#   docker-compose down                # stop and remove containers
+
+version: "3.9"
+
+services:
+
+  # ── Flight Service ─────────────────────────────────────────────────────────
+  flight-service:
+    build: ./flight-service
+    container_name: flight-service
+    ports:
+      - "8000:8000"
+    networks:
+      - alms-network
+
+  # ── Auth Service ───────────────────────────────────────────────────────────
+  auth-service:
+    build: ./auth-service
+    container_name: auth-service
+    ports:
+      - "8003:8003"
+    networks:
+      - alms-network
+
+  # ── Booking Service ────────────────────────────────────────────────────────
+  # Depends on flight-service for seat checks and auth-service for JWT keys.
+  # AWS credentials are read from a local .env file (see .env.example).
+  booking-service:
+    build: ./booking-service
+    container_name: booking-service
+    ports:
+      - "8001:8001"
+    environment:
+      # Resolve flight-service via the docker network, not host.docker.internal
+      FLIGHT_SERVICE_URL: http://flight-service:8000
+      # SNS config — override in .env or set directly here for local testing
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:-arn:aws:sns:eu-west-1:180571023460:alms-booking-topic}
+      AWS_REGION: ${AWS_REGION:-eu-west-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    depends_on:
+      - flight-service
+      - auth-service
+    networks:
+      - alms-network
+
+  # ── Baggage Service ────────────────────────────────────────────────────────
+  baggage-service:
+    build: ./baggage-service
+    container_name: baggage-service
+    ports:
+      - "8002:8002"
+    environment:
+      DYNAMODB_BAGGAGE_TABLE: ${DYNAMODB_BAGGAGE_TABLE:-dams_baggage}
+      AWS_DEFAULT_REGION: ${AWS_REGION:-eu-west-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    networks:
+      - alms-network
+
+networks:
+  alms-network:
+    driver: bridge
