@@ -118,7 +118,7 @@ export function LoginPage() {
                 <Plane className="h-6 w-6" />
               </div>
               <div>
-                <p className="text-lg font-bold tracking-tight">DAMS</p>
+                <p className="text-lg font-bold tracking-tight">AeroLink</p>
                 <p className="text-xs uppercase tracking-widest text-muted-foreground">
                   Operations Console
                 </p>
@@ -159,7 +159,7 @@ export function LoginPage() {
               <Plane className="h-5 w-5" />
             </div>
             <div>
-              <p className="font-bold tracking-tight">DAMS</p>
+              <p className="font-bold tracking-tight">AeroLink</p>
               <p className="text-[10px] uppercase tracking-widest text-muted-foreground">
                 Operations Console
               </p>

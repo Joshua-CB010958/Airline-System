@@ -41,7 +41,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
               <Plane className="h-5 w-5" />
             </div>
             <div className="leading-tight">
-              <p className="text-sm font-bold tracking-tight">DAMS</p>
+              <p className="text-sm font-bold tracking-tight">AeroLink</p>
               <p className="text-[10px] uppercase tracking-widest text-muted-foreground">
                 Ops Console
               </p>
