@@ -77,6 +77,7 @@ The business problem addressed is the operational complexity of airline manageme
 | 8 | **Service-to-Service Communication** | Booking ↔ Flight | Token forwarding zero-trust pattern: the Booking Service forwards the caller's Bearer token to the Flight Service, which independently validates it. No implicit trust between services. |
 | 9 | **Containerised Deployment** | All Services | Each microservice has an independent Dockerfile. Docker Compose orchestrates all four services over a shared bridge network (`alms-network`) with DNS-based service discovery. |
 | 10 | **Auto-Generated API Documentation** | All Services | Each FastAPI service exposes Swagger UI (`/docs`), ReDoc (`/redoc`), and raw OpenAPI JSON (`/openapi.json`) automatically. |
+| 11 | **Web Operations Console (Frontend)** | Frontend (`frontend/`) | React + TypeScript single-page application that drives every service over its REST API. Provides JWT login, role-aware navigation and controls (RBAC mirrored client-side), flight/booking/baggage management, live service-health monitoring, and an architecture topology view. Talks to the services via same-origin `/api/*` paths proxied by Vite, so no CORS change is required and no AWS/database secret ever reaches the browser. |
 
 ---
 
@@ -110,6 +111,8 @@ The following are intentionally excluded from the current implementation. Each e
 
 Each service is independently deployable and communicates with other services exclusively over HTTP using JSON. Auth and Flight use in-memory stores, while Booking persists to Aurora PostgreSQL and Baggage persists to DynamoDB. There is no shared database or shared memory between services.
 
+A separate **React + TypeScript web client** (`frontend/`) acts as the primary operations console, consuming these services' REST APIs. It is not a participant in the service mesh and holds no business state or secrets — it authenticates against the Auth Service and calls the other services with the resulting JWT.
+
 ---
 
 ## 7. Current Architecture
@@ -118,7 +121,8 @@ Each service is independently deployable and communicates with other services ex
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     Client (Browser / Postman)               │
+│      Client — React Ops Console (frontend/) · Browser/Postman │
+│      calls services via same-origin /api/* (Vite proxy)       │
 └───────────────┬─────────────┬──────────────┬────────────────┘
                 │             │              │
          :8003  │      :8000  │       :8001  │       :8002
@@ -201,6 +205,18 @@ AWS Region: eu-west-1 (Ireland)
 | **AWS Lambda** | Serverless notification processing |
 | **PowerShell** (`start-all.ps1`) | Windows development startup script |
 
+### 8.5 Frontend (Web Operations Console)
+
+| Technology | Purpose |
+|-----------|---------|
+| **React** 18 + **TypeScript** | Single-page operations console (`frontend/`) |
+| **Vite** 5 | Build tool & dev server (with `/api/*` proxy to each service) |
+| **Tailwind CSS** + **shadcn/ui** (Radix) | Styling and accessible UI primitives |
+| **TanStack Query** | Server-state management, caching, and polling (live health) |
+| **Axios** | HTTP client — per-service instances with JWT + error interceptors |
+| **React Router** | Client-side routing with role-based route guards |
+| **Recharts** | Dashboard data visualisations |
+
 ---
 
 ## 9. AWS Infrastructure
@@ -269,6 +285,7 @@ The following additions would elevate the system toward distinction or high-dist
 | Baggage Database (DynamoDB `dams_baggage`) | AWS | Complete |
 | Notification Service (Lambda + SNS) | Deployed to AWS Lambda | Complete |
 | Docker Compose orchestration | `docker-compose.yml` | Complete |
+| Web Operations Console (React frontend) | `frontend/` | Complete |
 | API Specification | `Docs/api-specification.md` | Complete |
 | AWS SNS topic (`alms-booking-topic`) | eu-west-1 | Provisioned |
 
@@ -298,3 +315,8 @@ The following screenshots provide the highest evidence value for marking:
 10. AWS Lambda Console — Notification function execution log showing event received
 11. CloudWatch logs (if available) — Lambda invocation trace
 12. Docker Compose network — `alms-network` bridge connecting all containers
+13. Frontend — login screen with the three role-based demo accounts
+14. Frontend — dashboard showing live service-health grid (4/4 online) and KPIs
+15. Frontend — admin architecture topology diagram with live status indicators
+16. Frontend — same booking/baggage view as passenger vs. staff, showing that
+    Cancel/Update controls are hidden for the passenger role (RBAC in the UI)
