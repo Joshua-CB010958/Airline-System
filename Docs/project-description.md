@@ -71,8 +71,8 @@ The business problem addressed is the operational complexity of airline manageme
 | 2 | **Role-Based Access Control (RBAC)** | All Services | Three-tier privilege model (`passenger`, `staff`, `admin`) enforced at the endpoint level via FastAPI dependency injection (`require_roles()`). |
 | 3 | **User Profile Management** | Auth Service | Token-based identity resolution (`GET /me`). In-memory user store with bcrypt-hashed passwords. |
 | 4 | **Flight Inventory** | Flight Service | CRUD access to flight records including origin, destination, available seats, and status. Seat availability is managed atomically per booking transaction. |
-| 5 | **Booking Management** | Booking Service | Full booking lifecycle — create, retrieve, cancel. Booking creation validates flight availability via synchronous service call. Cancellation restores seat inventory. |
-| 6 | **Baggage Tracking** | Baggage Service | Read access for all roles; status and location updates restricted to staff and admin. Pre-seeded with representative baggage states (Checked In, In Transit, Arrived, Lost). |
+| 5 | **Booking Management** | Booking Service | Full booking lifecycle — create, retrieve, cancel. Booking creation validates flight availability via synchronous service call. Records are persisted in Aurora PostgreSQL. Cancellation restores seat inventory. |
+| 6 | **Baggage Tracking** | Baggage Service | Read access for all roles; status and location updates restricted to staff and admin. Records are stored in DynamoDB. |
 | 7 | **Event-Driven Notifications** | Booking Service + Notification Lambda | Booking confirmation events published to AWS SNS (`alms-booking-topic`) asynchronously. AWS Lambda function consumes events and processes notifications. Decoupled from the booking transaction — notification failures do not affect booking reliability. |
 | 8 | **Service-to-Service Communication** | Booking ↔ Flight | Token forwarding zero-trust pattern: the Booking Service forwards the caller's Bearer token to the Flight Service, which independently validates it. No implicit trust between services. |
 | 9 | **Containerised Deployment** | All Services | Each microservice has an independent Dockerfile. Docker Compose orchestrates all four services over a shared bridge network (`alms-network`) with DNS-based service discovery. |
@@ -86,9 +86,6 @@ The following are intentionally excluded from the current implementation. Each e
 
 | Feature | Reason for Exclusion |
 |---------|---------------------|
-| **Persistent database (PostgreSQL, MySQL)** | In-memory stores are sufficient for demonstration. Adding a database would require migration scripts, connection pooling, and transaction management beyond the assignment scope. |
-| **Aurora / RDS** | Cloud-managed relational database. Excluded to keep infrastructure footprint manageable; in-memory storage serves the functional demonstration goal. Identified as a distinction-level enhancement. |
-| **DynamoDB** | NoSQL persistent store. Excluded for the same reason as Aurora. Suitable for baggage or booking records in a production scenario. |
 | **API Gateway** | Centralised request routing, rate limiting, and SSL termination. Excluded; services are accessed directly by port. Would be a production-readiness addition. |
 | **EventBridge** | Advanced event routing and rule-based fan-out. SNS is sufficient for the current single-subscriber notification pattern. EventBridge would be warranted if multiple consumers or routing rules were required. |
 | **CQRS / Saga patterns** | Distributed transaction patterns. The current booking flow uses synchronous compensation (best-effort seat restore on cancellation), which is adequate at this scale. |
@@ -107,11 +104,11 @@ The following are intentionally excluded from the current implementation. Each e
 |---------|------|------------|-----------------------|
 | **Auth Service** | 8003 | Docker container | Issues JWT tokens; manages user credentials; exposes current user profile. |
 | **Flight Service** | 8000 | Docker container | Maintains flight inventory; manages seat availability atomically in response to bookings and cancellations. |
-| **Booking Service** | 8001 | Docker container | Orchestrates the booking lifecycle; validates flight availability via synchronous service call; publishes booking events to SNS. |
-| **Baggage Service** | 8002 | Docker container | Tracks baggage item status and location; updates restricted to operational roles. |
+| **Booking Service** | 8001 | Docker container | Orchestrates the booking lifecycle; validates flight availability via synchronous service call; persists bookings in Aurora PostgreSQL; publishes booking events to SNS. |
+| **Baggage Service** | 8002 | Docker container | Tracks baggage item status and location in DynamoDB; updates restricted to operational roles. |
 | **Notification Service** | N/A | AWS Lambda (serverless) | Event-driven consumer of SNS booking events; processes and dispatches passenger notifications asynchronously. |
 
-Each service is independently deployable, maintains its own in-memory data store, and communicates with other services exclusively over HTTP using JSON. There is no shared database or shared memory between services.
+Each service is independently deployable and communicates with other services exclusively over HTTP using JSON. Auth and Flight use in-memory stores, while Booking persists to Aurora PostgreSQL and Baggage persists to DynamoDB. There is no shared database or shared memory between services.
 
 ---
 
@@ -128,7 +125,7 @@ Each service is independently deployable, maintains its own in-memory data store
     ┌───────────▼─┐  ┌────────▼────┐  ┌─────▼────────┐  ┌─────▼────────┐
     │ Auth Service│  │Flight Service│  │Booking Service│  │Baggage Service│
     │  FastAPI    │  │  FastAPI    │  │  FastAPI     │  │  FastAPI     │
-    │  bcrypt/JWT │  │  In-Memory  │  │  In-Memory   │  │  In-Memory   │
+    │  bcrypt/JWT │  │  In-Memory  │  │  Aurora PG   │  │  DynamoDB    │
     └─────────────┘  └─────────────┘  └──────┬───────┘  └──────────────┘
                                              │ JWT forwarding
                                      ┌───────▼───────┐
@@ -161,7 +158,7 @@ AWS Region: eu-west-1 (Ireland)
 | **Asynchronous Event Publishing** | Booking → SNS → Lambda | Booking confirmation events are published fire-and-forget. Notification delivery is fully decoupled from the booking transaction. |
 | **Stateless Authentication** | All services | JWT tokens are verified locally by each service using a shared symmetric key. No session state is maintained server-side. |
 | **Dependency Injection for RBAC** | All services | `require_roles()` is a FastAPI dependency factory; role enforcement is composable and reusable across endpoints without duplication. |
-| **In-Memory Seed Data** | All services | Pre-populated data enables immediate functional testing without database provisioning. |
+| **Hybrid Persistence** | All services | Auth and Flight use in-memory seed data for fast demos, while Booking persists to Aurora PostgreSQL and Baggage persists to DynamoDB. |
 
 ---
 
@@ -191,6 +188,8 @@ AWS Region: eu-west-1 (Ireland)
 | **boto3** | 1.34.69 | AWS SDK — SNS event publishing from Booking Service |
 | **requests** | 2.31.0 | Synchronous HTTP client — Booking to Flight Service calls |
 | **python-multipart** | 0.0.12 | Multipart form data parsing (OAuth2 password flow on `/login`) |
+| **SQLAlchemy** | 2.x | ORM used by Booking Service for Aurora PostgreSQL persistence |
+| **psycopg2-binary** | 2.9.x | PostgreSQL driver used by SQLAlchemy in the Booking Service |
 
 ### 8.4 Infrastructure & Deployment
 
@@ -210,6 +209,8 @@ AWS Region: eu-west-1 (Ireland)
 |----------|------|--------|---------|
 | `alms-booking-topic` | SNS Topic | eu-west-1 | Receives booking lifecycle events from Booking Service |
 | Notification Lambda | Lambda Function | eu-west-1 | Consumes SNS events and processes passenger notifications |
+| Booking Database | Aurora PostgreSQL | eu-west-1 | Persistent storage for booking records |
+| `dams_baggage` | DynamoDB Table | eu-west-1 | Persistent storage for baggage records |
 
 **AWS Credentials Flow:**
 1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) loaded from `.env` file into the Booking Service container at runtime.
@@ -228,7 +229,7 @@ AWS Region: eu-west-1 (Ireland)
 |----------|----------------------|-----------|
 | **Shared JWT secret (symmetric HS256)** | Asymmetric RS256 with per-service public keys | Symmetric key is simpler to distribute in a controlled demo environment. RS256 would be preferred in production (no secret sharing required). |
 | **Token forwarding (zero-trust)** | Service accounts with internal tokens | Forwarding preserves the caller's identity and role throughout the call chain without introducing a separate privileged identity. |
-| **In-memory data stores** | PostgreSQL / SQLite | Eliminates database provisioning for the demo context. Acknowledged as not suitable for production. |
+| **Hybrid persistence** | All in-memory | Booking and baggage data persist in Aurora and DynamoDB, while auth and flight remain in-memory for fast demos. |
 | **SNS (not SQS)** | SQS queue | SNS allows fan-out to multiple subscribers without re-architecting. A single subscription to Lambda is sufficient for the current use case. |
 | **Synchronous Booking → Flight call** | Saga / event-driven booking | Direct HTTP call is simpler and provides immediate consistency for seat availability. Saga would be warranted for multi-service distributed transactions at scale. |
 | **Best-effort seat restore on cancellation** | Two-phase commit | Full 2PC is operationally complex. Best-effort restore is adequate given the demo scope and in-memory state. |
@@ -242,8 +243,6 @@ The following additions would elevate the system toward distinction or high-dist
 
 | Enhancement | AWS Service | Value |
 |-------------|------------|-------|
-| **Persistent relational storage** | Amazon Aurora Serverless v2 or RDS (PostgreSQL) | Replaces in-memory stores; data survives restarts; demonstrates production-grade persistence |
-| **NoSQL storage for bookings** | Amazon DynamoDB | Demonstrates knowledge of NoSQL patterns; highly scalable key-value access pattern suits booking records |
 | **Centralised API routing** | Amazon API Gateway | Single entry point; built-in rate limiting, throttling, and SSL termination; integrates with Cognito for auth |
 | **Advanced event routing** | Amazon EventBridge | Rule-based fan-out beyond SNS; enables conditional routing of booking events to multiple consumers |
 | **Secrets management** | AWS Secrets Manager or Parameter Store | Removes hardcoded JWT secret; demonstrates secure configuration management |
@@ -266,6 +265,8 @@ The following additions would elevate the system toward distinction or high-dist
 | Flight Service (inventory management) | `flight-service/` | Complete |
 | Booking Service (lifecycle + SNS) | `booking-service/` | Complete |
 | Baggage Service (tracking) | `baggage-service/` | Complete |
+| Booking Database (Aurora PostgreSQL) | AWS | Complete |
+| Baggage Database (DynamoDB `dams_baggage`) | AWS | Complete |
 | Notification Service (Lambda + SNS) | Deployed to AWS Lambda | Complete |
 | Docker Compose orchestration | `docker-compose.yml` | Complete |
 | API Specification | `Docs/api-specification.md` | Complete |

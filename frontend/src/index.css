@@ -1,0 +1,108 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   DAMS "Operations Center" theme.
+   A dark, deep-navy command-center palette with cool blue accents — chosen to
+   foreground architecture & service-status visibility for a distributed-systems
+   demo rather than consumer booking aesthetics.
+   ──────────────────────────────────────────────────────────────────────────── */
+@layer base {
+  :root,
+  .dark {
+    --background: 222 47% 7%;
+    --foreground: 210 40% 96%;
+
+    --card: 220 43% 11%;
+    --card-foreground: 210 40% 96%;
+
+    --popover: 220 45% 9%;
+    --popover-foreground: 210 40% 96%;
+
+    --primary: 205 90% 54%;
+    --primary-foreground: 222 47% 8%;
+
+    --secondary: 217 33% 18%;
+    --secondary-foreground: 210 40% 96%;
+
+    --muted: 217 33% 16%;
+    --muted-foreground: 215 20% 65%;
+
+    --accent: 199 89% 48%;
+    --accent-foreground: 222 47% 8%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+
+    --success: 152 62% 42%;
+    --success-foreground: 210 40% 98%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 38 90% 10%;
+
+    --border: 217 33% 20%;
+    --input: 217 33% 20%;
+    --ring: 205 90% 54%;
+
+    --sidebar: 222 50% 6%;
+    --sidebar-foreground: 210 40% 90%;
+
+    --radius: 0.65rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
+  }
+  /* Custom scrollbars to match the console aesthetic */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--background));
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 9999px;
+    border: 2px solid hsl(var(--background));
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
+  }
+}
+
+@layer utilities {
+  /* Subtle grid + radial glow used on the login and dashboard backdrops */
+  .bg-grid {
+    background-image: linear-gradient(
+        hsl(var(--border) / 0.4) 1px,
+        transparent 1px
+      ),
+      linear-gradient(90deg, hsl(var(--border) / 0.4) 1px, transparent 1px);
+    background-size: 44px 44px;
+  }
+  .bg-radial-glow {
+    background: radial-gradient(
+      60% 60% at 50% 0%,
+      hsl(var(--primary) / 0.18) 0%,
+      transparent 70%
+    );
+  }
+  .text-balance {
+    text-wrap: balance;
+  }
+  .glass {
+    background: hsl(var(--card) / 0.7);
+    backdrop-filter: blur(12px);
+  }
+}

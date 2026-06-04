@@ -31,6 +31,10 @@ from datetime import datetime
 from typing import Optional
 
 import boto3
+from sqlalchemy import Column, DateTime, String, create_engine
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.orm import declarative_base, sessionmaker
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -51,6 +55,81 @@ SNS_TOPIC_ARN = os.getenv(
     "arn:aws:sns:eu-west-1:180571023460:alms-booking-topic",
 )
 
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+Base = declarative_base()
+
+class Booking(Base):
+    __tablename__ = "bookings"
+
+    booking_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    passenger_name = Column(String(255), nullable=False)
+    passenger_email = Column(String(255), nullable=False)
+    flight_id = Column(String(50), nullable=False)
+    seat_class = Column(String(50), nullable=False)
+    status = Column(String(50), nullable=False)
+    created_at = Column(DateTime, nullable=False)
+
+def _build_database_url() -> str:
+    if not all([DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD]):
+        raise RuntimeError(
+            "Database configuration is incomplete. Ensure DB_HOST, DB_PORT, "
+            "DB_NAME, DB_USER, and DB_PASSWORD are set."
+        )
+    return (
+        "postgresql+psycopg2://{user}:{password}@{host}:{port}/{name}"
+    ).format(
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        port=DB_PORT,
+        name=DB_NAME,
+    )
+
+def _create_engine():
+    return create_engine(_build_database_url(), pool_pre_ping=True)
+
+engine = _create_engine()
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+def get_db():
+    try:
+        db = SessionLocal()
+    except OperationalError as exc:
+        logger.error("[booking-service] Database connection failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed. Please try again later.",
+        )
+    try:
+        yield db
+    finally:
+        db.close()
+
+def _booking_to_response(booking: Booking) -> dict:
+    return {
+        "id": str(booking.booking_id),
+        "flight_id": booking.flight_id,
+        "passenger_name": booking.passenger_name,
+        "passenger_email": booking.passenger_email,
+        "seat_class": booking.seat_class,
+        "status": booking.status,
+        "created_at": booking.created_at.isoformat() + "Z",
+    }
+
+
+def _parse_booking_id(booking_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(booking_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Booking '{booking_id}' not found.",
+        )
 # AWS region — must match the region in the topic ARN.
 AWS_REGION = os.getenv("AWS_REGION", "eu-west-1")
 
@@ -325,12 +404,20 @@ def root():
     """Public health-check endpoint — no authentication required."""
     return {"service": "Booking Service", "status": "running"}
 
+@app.on_event("startup")
+def startup():
+    try:
+        Base.metadata.create_all(bind=engine)
+    except OperationalError as exc:
+        logger.error("[booking-service] Database unavailable at startup: %s", exc)
+        raise
+
 
 # ── Protected Endpoints — all authenticated roles ──────────────────────────────
 
 @app.get("/bookings", response_model=list[BookingResponse], tags=["Bookings"],
          dependencies=[Depends(get_current_user)])
-def get_all_bookings():
+def get_all_bookings(db=Depends(get_db)):
     """
     List all bookings.
 
@@ -338,12 +425,20 @@ def get_all_bookings():
     **Roles allowed:** passenger, staff, admin.
     Returns HTTP 401 if the token is missing or invalid.
     """
-    return list(bookings_db.values())
+    try:
+        bookings = db.query(Booking).all()
+    except SQLAlchemyError as exc:
+        logger.error("[booking-service] Database read failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable. Please try again later.",
+        )
+    return [_booking_to_response(booking) for booking in bookings]
 
 
 @app.get("/booking/{id}", response_model=BookingResponse, tags=["Bookings"],
          dependencies=[Depends(get_current_user)])
-def get_booking(id: str):
+def get_booking(id: str, db=Depends(get_db)):
     """
     Retrieve a single booking by ID.
 
@@ -351,18 +446,26 @@ def get_booking(id: str):
     **Roles allowed:** passenger, staff, admin.
     Returns HTTP 401 if token is missing/invalid, HTTP 404 if booking not found.
     """
-    booking = bookings_db.get(id)
+    booking_uuid = _parse_booking_id(id)
+    try:
+        booking = db.query(Booking).filter(Booking.booking_id == booking_uuid).first()
+    except SQLAlchemyError as exc:
+        logger.error("[booking-service] Database read failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable. Please try again later.",
+        )
     if not booking:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Booking '{id}' not found.",
         )
-    return booking
+    return _booking_to_response(booking)
 
 
 @app.post("/booking", response_model=BookingResponse, status_code=201, tags=["Bookings"],
           dependencies=[Depends(require_roles(["passenger", "staff", "admin"]))])
-def create_booking(payload: BookingRequest, request: Request):
+def create_booking(payload: BookingRequest, request: Request, db=Depends(get_db)):
     """
     Create a new flight booking.
 
@@ -377,7 +480,7 @@ def create_booking(payload: BookingRequest, request: Request):
     1. Validate seat_class value.
     2. Call Flight Service (GET /flight/{id}) — forwarding token — to check availability.
     3. Reject with HTTP 409 if no seats remain.
-    4. Persist the booking in memory.
+    4. Persist the booking in Aurora.
     5. Call Flight Service (PATCH /flight/{id}/seat) — forwarding token — to decrement seat.
     6. Publish a booking-created event to Amazon SNS.
     7. Return the created booking (HTTP 201).
@@ -402,17 +505,25 @@ def create_booking(payload: BookingRequest, request: Request):
         )
 
     # Step 3: Persist booking
-    booking_id = str(uuid.uuid4())
-    new_booking = {
-        "id": booking_id,
-        "flight_id": payload.flight_id,
-        "passenger_name": payload.passenger_name,
-        "passenger_email": payload.passenger_email,
-        "seat_class": payload.seat_class,
-        "status": "confirmed",
-        "created_at": datetime.utcnow().isoformat() + "Z",
-    }
-    bookings_db[booking_id] = new_booking
+    booking = Booking(
+        passenger_name=payload.passenger_name,
+        passenger_email=payload.passenger_email,
+        flight_id=payload.flight_id,
+        seat_class=payload.seat_class,
+        status="confirmed",
+        created_at=datetime.utcnow(),
+    )
+    try:
+        db.add(booking)
+        db.commit()
+        db.refresh(booking)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("[booking-service] Booking create failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable. Please try again later.",
+        )
 
     # Step 4: Decrement seat count on Flight Service (token forwarded)
     decrement_seat(payload.flight_id, auth_headers)
@@ -420,16 +531,17 @@ def create_booking(payload: BookingRequest, request: Request):
     # Step 5: Publish booking-created event to SNS.
     # Only reached after the booking is persisted and the seat decremented.
     # Raises HTTP 503 if the publish fails — see publish_booking_event() for details.
-    publish_booking_event(new_booking)
+    booking_response = _booking_to_response(booking)
+    publish_booking_event(booking_response)
 
-    return new_booking
+    return booking_response
 
 
 # ── Protected Endpoints — staff / admin only ───────────────────────────────────
 
 @app.delete("/booking/{id}", status_code=200, tags=["Bookings"],
             dependencies=[Depends(require_roles(["staff", "admin"]))])
-def delete_booking(id: str, request: Request):
+def delete_booking(id: str, request: Request, db=Depends(get_db)):
     """
     Cancel and delete a booking by ID.
 
@@ -439,23 +551,38 @@ def delete_booking(id: str, request: Request):
 
     **Deletion logic:**
     1. Look up booking — return HTTP 404 if not found.
-    2. Remove booking from store.
+    2. Remove booking from Aurora.
     3. Call Flight Service (PATCH /flight/{id}/seat/restore) — forwarding token —
        to restore the freed seat (best-effort; booking is deleted even if this fails).
     """
-    booking = bookings_db.get(id)
+    booking_uuid = _parse_booking_id(id)
+    try:
+        booking = db.query(Booking).filter(Booking.booking_id == booking_uuid).first()
+    except SQLAlchemyError as exc:
+        logger.error("[booking-service] Database read failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable. Please try again later.",
+        )
     if not booking:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Booking '{id}' not found.",
         )
 
-    flight_id = booking["flight_id"]
 
-    # Remove booking first so the response is consistent even if seat restore fails
-    del bookings_db[id]
+    try:
+        db.delete(booking)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("[booking-service] Booking delete failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable. Please try again later.",
+        )
 
-    # Best-effort seat restore — logs a warning on failure, does not block response
-    increment_seat(flight_id, _forward_auth(request))
+    auth_headers = _forward_auth(request)
+    increment_seat(booking.flight_id, auth_headers)
 
     return {"message": f"Booking '{id}' has been cancelled successfully."}

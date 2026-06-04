@@ -89,9 +89,36 @@ Endpoints are protected by a `require_roles()` dependency factory. When invoked,
 | Property              | Value                               |
 |-----------------------|-------------------------------------|
 | **Base URL**          | `http://localhost:8003`             |
-| **Purpose**           | Issues JWT tokens; exposes current user profile |
-| **Authentication**    | Required for `/me`; not required for `/login` |
+| **Purpose**           | Issues JWT tokens; exposes current user profile and role-scoped sample endpoints |
+| **Authentication**    | Required for `/me` and role-scoped endpoints; not required for `/login` or `/health` |
 | **Role Restrictions** | See per-endpoint detail below       |
+
+---
+
+#### `GET /health`
+
+**Purpose:** Public health probe for uptime checks.
+
+**Authentication Required:** No
+
+**Allowed Roles:** Public — no token required
+
+**Request Example:**
+```
+GET /health HTTP/1.1
+Host: localhost:8003
+```
+
+**Response Body (200 OK):**
+```json
+{
+  "status": "healthy",
+  "service": "airline-auth-service",
+  "port": 8003
+}
+```
+
+**Success Status Code:** `200 OK`
 
 ---
 
@@ -173,15 +200,150 @@ Authorization: Bearer <token>
 
 ---
 
+#### `GET /bookings/create`
+
+**Purpose:** Returns a simulated booking response for authenticated users.
+
+**Authentication Required:** Yes
+
+**Allowed Roles:** `passenger`, `staff`, `admin`
+
+**Request Example:**
+```
+GET /bookings/create HTTP/1.1
+Host: localhost:8003
+Authorization: Bearer <token>
+```
+
+**Response Body (200 OK):**
+```json
+{
+  "message": "Booking successfully created by 'passenger1'.",
+  "booked_by_role": "passenger",
+  "booking_ref": "BK-20260525-001"
+}
+```
+
+**Success Status Code:** `200 OK`
+
+**Error Responses:**
+
+| Code | Condition              |
+|------|------------------------|
+| 401  | Invalid or absent token |
+| 403  | Role not permitted      |
+
+---
+
+#### `GET /staff/flights`
+
+**Purpose:** Returns a role-restricted flight management payload.
+
+**Authentication Required:** Yes
+
+**Allowed Roles:** `staff`, `admin`
+
+**Request Example:**
+```
+GET /staff/flights HTTP/1.1
+Host: localhost:8003
+Authorization: Bearer <token>
+```
+
+**Response Body (200 OK):**
+```json
+{
+  "message": "Flight management access granted to 'staff1'.",
+  "role": "staff",
+  "flights": [
+    {"id": "FL001", "route": "CMB → LHR", "status": "On Time"}
+  ]
+}
+```
+
+**Success Status Code:** `200 OK`
+
+**Error Responses:**
+
+| Code | Condition              |
+|------|------------------------|
+| 401  | Invalid or absent token |
+| 403  | Role not permitted      |
+
+---
+
+#### `GET /admin/users`
+
+**Purpose:** Lists all users in the auth store (admin only).
+
+**Authentication Required:** Yes
+
+**Allowed Roles:** `admin`
+
+**Request Example:**
+```
+GET /admin/users HTTP/1.1
+Host: localhost:8003
+Authorization: Bearer <token>
+```
+
+**Response Body (200 OK):**
+```json
+{
+  "requested_by": "admin1",
+  "users": [
+    {"username": "admin1", "role": "admin", "email": "admin1@airline.com", "full_name": "Alice Admin"}
+  ]
+}
+```
+
+**Success Status Code:** `200 OK`
+
+**Error Responses:**
+
+| Code | Condition              |
+|------|------------------------|
+| 401  | Invalid or absent token |
+| 403  | Role not permitted      |
+
+---
+
 ### 3.2 Booking Service
 
 | Property              | Value                                                                 |
 |-----------------------|-----------------------------------------------------------------------|
 | **Base URL**          | `http://localhost:8001`                                               |
 | **Purpose**           | Manages flight bookings. Validates flight availability by calling the Flight Service before confirming a booking. |
-| **Authentication**    | Required for all listed endpoints                                     |
+| **Authentication**    | Required for all listed endpoints except `/`                          |
 | **Role Restrictions** | See per-endpoint detail below                                         |
 | **Upstream Dependency** | Flight Service at `http://localhost:8000` (configurable via `FLIGHT_SERVICE_URL`) |
+| **Data Store**        | Aurora PostgreSQL (SQLAlchemy) |
+
+---
+
+#### `GET /`
+
+**Purpose:** Public health probe for uptime checks.
+
+**Authentication Required:** No
+
+**Allowed Roles:** Public — no token required
+
+**Request Example:**
+```
+GET / HTTP/1.1
+Host: localhost:8001
+```
+
+**Response Body (200 OK):**
+```json
+{
+  "service": "Booking Service",
+  "status": "running"
+}
+```
+
+**Success Status Code:** `200 OK`
 
 ---
 
@@ -231,6 +393,7 @@ Authorization: Bearer <token>
 | Code | Condition              |
 |------|------------------------|
 | 401  | Invalid or absent token |
+| 503  | Booking database is unavailable |
 
 ---
 
@@ -276,6 +439,7 @@ Authorization: Bearer <token>
 |------|----------------------------------------|
 | 401  | Invalid or absent token                |
 | 404  | No booking found for the provided `id` |
+| 503  | Booking database is unavailable        |
 
 ---
 
@@ -325,9 +489,10 @@ Authorization: Bearer <token>
 1. Validates `seat_class` is one of the accepted values.
 2. Calls `GET /flight/{flight_id}` on the Flight Service, forwarding the caller's Bearer token.
 3. Verifies that `available_seats > 0`; returns `409` if the flight is fully booked.
-4. Persists the booking record with a generated UUID.
+4. Persists the booking record in Aurora PostgreSQL with a generated UUID.
 5. Calls `PATCH /flight/{flight_id}/seat` on the Flight Service to decrement seat count.
-6. Returns the created booking.
+6. Publishes a booking-created event to Amazon SNS.
+7. Returns the created booking.
 
 **Error Responses:**
 
@@ -338,6 +503,7 @@ Authorization: Bearer <token>
 | 404  | `flight_id` does not correspond to a known flight                        |
 | 409  | Flight has no remaining available seats                                  |
 | 422  | Request body is missing required fields or `seat_class` is not a valid value |
+| 503  | Booking database is unavailable                                          |
 | 503  | Flight Service is unreachable                                            |
 | 504  | Flight Service did not respond within the timeout threshold              |
 
@@ -375,7 +541,7 @@ Authorization: Bearer <token>
 
 **Processing Steps:**
 1. Validates that the booking exists; returns `404` if not found.
-2. Removes the booking from the in-memory store.
+2. Removes the booking from Aurora PostgreSQL.
 3. Calls `PATCH /flight/{flight_id}/seat/restore` on the Flight Service (best-effort; does not fail the request if the restore call is unsuccessful).
 4. Returns a confirmation message.
 
@@ -386,6 +552,7 @@ Authorization: Bearer <token>
 | 401  | Invalid or absent token                |
 | 403  | `passenger` role; operation not permitted |
 | 404  | No booking found for the provided `id` |
+| 503  | Booking database is unavailable       |
 
 ---
 
@@ -395,8 +562,34 @@ Authorization: Bearer <token>
 |-----------------------|--------------------------------------------------------------------|
 | **Base URL**          | `http://localhost:8000`                                            |
 | **Purpose**           | Manages flight records and seat availability. Receives internal seat-management calls from the Booking Service. |
-| **Authentication**    | Required for all listed endpoints                                  |
+| **Authentication**    | Required for all listed endpoints except `/`                       |
 | **Role Restrictions** | See per-endpoint detail below                                      |
+
+---
+
+#### `GET /`
+
+**Purpose:** Public health probe for uptime checks.
+
+**Authentication Required:** No
+
+**Allowed Roles:** Public — no token required
+
+**Request Example:**
+```
+GET / HTTP/1.1
+Host: localhost:8000
+```
+
+**Response Body (200 OK):**
+```json
+{
+  "service": "Flight Service",
+  "status": "running"
+}
+```
+
+**Success Status Code:** `200 OK`
 
 ---
 
@@ -597,9 +790,36 @@ Authorization: Bearer <token>
 | Property              | Value                                                              |
 |-----------------------|--------------------------------------------------------------------|
 | **Base URL**          | `http://localhost:8002`                                            |
-| **Purpose**           | Tracks the status and location of passenger baggage items. Staff and admins may update baggage records; passengers may only view them. |
-| **Authentication**    | Required for all listed endpoints                                  |
+| **Purpose**           | Tracks the status and location of passenger baggage items in DynamoDB. Staff and admins may update baggage records; passengers may only view them. |
+| **Authentication**    | Required for all listed endpoints except `/`                       |
 | **Role Restrictions** | See per-endpoint detail below                                      |
+| **Data Store**        | Amazon DynamoDB (`dams_baggage`) |
+
+---
+
+#### `GET /`
+
+**Purpose:** Public health probe for uptime checks.
+
+**Authentication Required:** No
+
+**Allowed Roles:** Public — no token required
+
+**Request Example:**
+```
+GET / HTTP/1.1
+Host: localhost:8002
+```
+
+**Response Body (200 OK):**
+```json
+{
+  "service": "Baggage Service",
+  "status": "running"
+}
+```
+
+**Success Status Code:** `200 OK`
 
 ---
 
@@ -688,6 +908,7 @@ Authorization: Bearer <token>
 |------|----------------------------------------------|
 | 401  | Invalid or absent token                      |
 | 404  | No baggage record found for the provided `id` |
+| 503  | Baggage database is unavailable              |
 
 ---
 
@@ -743,6 +964,7 @@ Authorization: Bearer <token>
 | 403  | `passenger` role; operation not permitted          |
 | 404  | No baggage record found for the provided `baggage_id` |
 | 422  | Request body is missing `baggage_id` or `status`  |
+| 503  | Baggage database is unavailable                    |
 
 ---
 
@@ -755,7 +977,7 @@ Authorization: Bearer <token>
 | **Public API**        | None — this service exposes no HTTP endpoints        |
 | **Trigger Mechanism** | Asynchronous event consumption                      |
 
-The Notification Service is implemented as a serverless AWS Lambda function and does not expose a public HTTP API. It operates exclusively as an event-driven consumer. Booking lifecycle events — such as booking confirmation and cancellation — are published by the Booking Service and consumed asynchronously by the Lambda function, which subsequently dispatches the appropriate passenger notifications.
+The Notification Service is implemented as a serverless AWS Lambda function and does not expose a public HTTP API. It operates exclusively as an event-driven consumer. Booking lifecycle events — such as booking confirmation — are published by the Booking Service and consumed asynchronously by the Lambda function, which subsequently dispatches the appropriate passenger notifications.
 
 This design decouples notification delivery from the synchronous booking request path, ensuring that transient notification failures do not affect the reliability or response latency of the Booking Service.
 
@@ -764,7 +986,6 @@ This design decouples notification delivery from the synchronous booking request
 | Event                  | Source Service  | Description                                         |
 |------------------------|-----------------|-----------------------------------------------------|
 | Booking Confirmed      | Booking Service | Emitted when `POST /booking` completes successfully |
-| Booking Cancelled      | Booking Service | Emitted when `DELETE /booking/{id}` completes successfully |
 
 Because the Notification Service has no directly callable endpoints, it is not included in the access control matrix and does not participate in the JWT authentication flow.
 
@@ -778,14 +999,21 @@ The following table summarises role-based access permissions across all publicly
 |------------------|---------------------------------|--------|:-----------:|:-------:|:-------:|
 | **Auth**         | `/login`                        | POST   | ✓ (public)  | ✓       | ✓       |
 | **Auth**         | `/me`                           | GET    | ✓           | ✓       | ✓       |
+| **Auth**         | `/health`                       | GET    | ✓ (public)  | ✓       | ✓       |
+| **Auth**         | `/bookings/create`              | GET    | ✓           | ✓       | ✓       |
+| **Auth**         | `/staff/flights`                | GET    | —           | ✓       | ✓       |
+| **Auth**         | `/admin/users`                  | GET    | —           | —       | ✓       |
+| **Booking**      | `/`                             | GET    | ✓ (public)  | ✓       | ✓       |
 | **Booking**      | `/bookings`                     | GET    | ✓           | ✓       | ✓       |
 | **Booking**      | `/booking/{id}`                 | GET    | ✓           | ✓       | ✓       |
 | **Booking**      | `/booking`                      | POST   | ✓           | ✓       | ✓       |
 | **Booking**      | `/booking/{id}`                 | DELETE | —           | ✓       | ✓       |
+| **Flight**       | `/`                             | GET    | ✓ (public)  | ✓       | ✓       |
 | **Flight**       | `/flights`                      | GET    | ✓           | ✓       | ✓       |
 | **Flight**       | `/flight/{id}`                  | GET    | ✓           | ✓       | ✓       |
 | **Flight**       | `/flight/{id}/seat`             | PATCH  | ✓ (internal)| ✓       | ✓       |
 | **Flight**       | `/flight/{id}/seat/restore`     | PATCH  | ✓ (internal)| ✓       | ✓       |
+| **Baggage**      | `/`                             | GET    | ✓ (public)  | ✓       | ✓       |
 | **Baggage**      | `/baggage`                      | GET    | ✓           | ✓       | ✓       |
 | **Baggage**      | `/baggage/{id}`                 | GET    | ✓           | ✓       | ✓       |
 | **Baggage**      | `/baggage/update`               | PATCH  | —           | ✓       | ✓       |
@@ -961,7 +1189,7 @@ The Booking Service does not maintain a service account or a separate identity f
 
 ### 7.3 Notification Event Flow
 
-Upon completion of a booking creation or cancellation, the Booking Service publishes a lifecycle event. The Notification Service, implemented as an AWS Lambda function, consumes this event asynchronously and dispatches the appropriate passenger notification. This asynchronous decoupling ensures that notification delivery failures do not propagate back to the booking transaction and do not affect the client-visible response.
+Upon completion of a booking creation, the Booking Service publishes a lifecycle event. The Notification Service, implemented as an AWS Lambda function, consumes this event asynchronously and dispatches the appropriate passenger notification. This asynchronous decoupling ensures that notification delivery failures do not propagate back to the booking transaction and do not affect the client-visible response.
 
 ---
 
@@ -977,11 +1205,16 @@ Each FastAPI service automatically generates an OpenAPI 3.0 specification and ex
 
 These interfaces provide a browser-accessible reference for endpoint schemas, request/response models, and live request execution during development and testing.
 
-### 8.2 In-Memory Data Storage
+### 8.2 Data Storage
 
-All services in this implementation use in-memory Python dictionaries and lists as their data stores. This approach eliminates external database dependencies, simplifying deployment and making the system self-contained for demonstration purposes. Data does not persist across service restarts.
+Storage choices are split by service to support scalability demonstrations:
 
-Pre-loaded seed data is defined at service startup and includes representative flights, baggage records, and user accounts to support immediate functional testing.
+- **Auth Service:** In-memory user store (non-persistent, demo use).
+- **Flight Service:** In-memory flight inventory (non-persistent, demo use).
+- **Booking Service:** Aurora PostgreSQL via SQLAlchemy (persistent storage).
+- **Baggage Service:** Amazon DynamoDB table `dams_baggage` (persistent storage).
+
+Pre-loaded seed data is defined at service startup for the in-memory services (auth and flight) to support immediate functional testing.
 
 ### 8.3 Service-to-Service Communication
 
