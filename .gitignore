@@ -1,7 +1,6 @@
 # ===== Secrets / credentials =====
 .env
 .env.*
-!.env.example
 credentials.txt
 *.pem
 *.key
@@ -37,10 +36,6 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-
-# ===== Load testing =====
-Locust/*.html
-locust-report*
 
 # ===== OS / Editor =====
 .DS_Store
