@@ -4,7 +4,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { baggageService } from "@/services/baggage.service";
-import type { UpdateBaggageInput } from "@/types";
+import type { CreateBaggageInput, UpdateBaggageInput } from "@/types";
 
 export const baggageKeys = {
   all: ["baggage"] as const,
@@ -15,6 +15,17 @@ export function useBaggage() {
   return useQuery({
     queryKey: baggageKeys.all,
     queryFn: baggageService.list,
+  });
+}
+
+/** Create a baggage record (staff/admin). */
+export function useCreateBaggage() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: CreateBaggageInput) => baggageService.create(input),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: baggageKeys.all });
+    },
   });
 }
 

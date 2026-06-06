@@ -66,6 +66,14 @@ export interface Baggage {
   location: string;
 }
 
+/** Payload for POST /baggage (staff/admin). The id is generated server-side. */
+export interface CreateBaggageInput {
+  passenger_name: string;
+  flight_id: number;
+  status: string;
+  location: string;
+}
+
 /** Payload for PATCH /baggage/update. */
 export interface UpdateBaggageInput {
   baggage_id: number;

@@ -11,6 +11,7 @@ Baggage status updates are restricted to staff and admin roles.
 Role matrix:
   GET  /baggage           — any authenticated user
   GET  /baggage/{id}      — any authenticated user
+  POST /baggage           — staff, admin only
   PATCH /baggage/update   — staff, admin only
 """
 
@@ -67,6 +68,7 @@ All endpoints require a valid **JWT Bearer token** issued by the
 |----------------------|:---------:|:-----:|:-----:|
 | GET /baggage         | ✓         | ✓     | ✓     |
 | GET /baggage/{id}    | ✓         | ✓     | ✓     |
+| POST /baggage        |           | ✓     | ✓     |
 | PATCH /baggage/update|           | ✓     | ✓     |
 """,
     version="1.0.0",
@@ -82,6 +84,14 @@ class BaggageItem(BaseModel):
     flight_id: int
     status: str
     location: str
+
+
+class BaggageCreateRequest(BaseModel):
+    """Payload accepted by POST /baggage. The id is generated server-side."""
+    passenger_name: str = Field(..., description="Name of the passenger")
+    flight_id: int = Field(..., description="ID of the associated flight")
+    status: str = Field(..., description="Initial baggage status, e.g. 'Checked In'")
+    location: str = Field(..., description="Current physical location")
 
 
 class BaggageUpdateRequest(BaseModel):
@@ -182,6 +192,60 @@ def get_baggage(id: int):
 
 
 # ── Protected Endpoints — staff / admin only ───────────────────────────────────
+
+@app.post("/baggage", response_model=BaggageItem, status_code=status.HTTP_201_CREATED,
+          tags=["Baggage"],
+          dependencies=[Depends(require_roles(["staff", "admin"]))])
+def create_baggage(payload: BaggageCreateRequest):
+    """
+    Create a new baggage record.
+
+    **Authentication:** Requires a valid JWT Bearer token.
+    **Roles allowed:** staff, admin only.
+    Returns HTTP 403 if a passenger attempts this action.
+
+    The numeric `id` is generated server-side as (current max id + 1).
+    DynamoDB has no auto-increment, so we derive the next id from a table
+    scan — adequate for this small demo dataset.
+    """
+    try:
+        # Find the current highest id so the new record gets a unique key.
+        # Projecting only the id keeps the scan payload minimal.
+        response = _table.scan(ProjectionExpression="id")
+    except (BotoCoreError, ClientError) as exc:
+        logger.error("DynamoDB Scan failed during create: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Baggage database is temporarily unavailable.",
+        )
+
+    existing_ids = [int(item["id"]) for item in response.get("Items", [])]
+    new_id = (max(existing_ids) + 1) if existing_ids else 1
+
+    new_item = {
+        "id": new_id,
+        "passenger_name": payload.passenger_name,
+        "flight_id": payload.flight_id,
+        "status": payload.status,
+        "location": payload.location,
+    }
+
+    try:
+        # ConditionExpression guards against the rare race where the id was
+        # taken between the scan and the write.
+        _table.put_item(
+            Item=new_item,
+            ConditionExpression="attribute_not_exists(id)",
+        )
+    except (BotoCoreError, ClientError) as exc:
+        logger.error("DynamoDB PutItem failed for id=%s: %s", new_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Baggage database is temporarily unavailable.",
+        )
+
+    return _deserialise(new_item)
+
 
 @app.patch("/baggage/update", response_model=BaggageItem, tags=["Baggage"],
            dependencies=[Depends(require_roles(["staff", "admin"]))])

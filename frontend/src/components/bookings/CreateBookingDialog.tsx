@@ -21,10 +21,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useCreateBooking } from "@/hooks/useBookings";
+import { useCreateBaggage } from "@/hooks/useBaggage";
 import { ApiError } from "@/services/apiClients";
 import type { Flight, SeatClass } from "@/types";
 
 const SEAT_CLASSES: SeatClass[] = ["economy", "business", "first"];
+const BAGGAGE_STATUSES = ["Checked In", "In Transit", "Arrived", "Lost"];
 
 export function CreateBookingDialog({ flights }: { flights?: Flight[] }) {
   const [open, setOpen] = useState(false);
@@ -32,13 +34,20 @@ export function CreateBookingDialog({ flights }: { flights?: Flight[] }) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [seatClass, setSeatClass] = useState<SeatClass>("economy");
+  const [addBaggage, setAddBaggage] = useState(false);
+  const [baggageStatus, setBaggageStatus] = useState(BAGGAGE_STATUSES[0]);
+  const [baggageLocation, setBaggageLocation] = useState("");
   const createBooking = useCreateBooking();
+  const createBaggage = useCreateBaggage();
 
   function reset() {
     setFlightId("");
     setName("");
     setEmail("");
     setSeatClass("economy");
+    setAddBaggage(false);
+    setBaggageStatus(BAGGAGE_STATUSES[0]);
+    setBaggageLocation("");
   }
 
   async function onSubmit(e: React.FormEvent) {
@@ -54,6 +63,30 @@ export function CreateBookingDialog({ flights }: { flights?: Flight[] }) {
       toast.success("Booking confirmed", {
         description: `Ref ${booking.id.slice(0, 8)}… · ${booking.passenger_name} · seat decremented & SNS event published.`,
       });
+
+      // Optionally create a matching baggage record. Done separately so a
+      // baggage failure (e.g. passenger role lacks permission) doesn't make
+      // the already-successful booking look failed.
+      if (addBaggage && baggageLocation.trim()) {
+        try {
+          const baggage = await createBaggage.mutateAsync({
+            passenger_name: name.trim(),
+            flight_id: Number(flightId),
+            status: baggageStatus,
+            location: baggageLocation.trim(),
+          });
+          toast.success("Baggage added", {
+            description: `Baggage #${baggage.id} · ${baggage.status} · ${baggage.location}`,
+          });
+        } catch (bagErr) {
+          const message =
+            bagErr instanceof ApiError
+              ? bagErr.message
+              : "Failed to add baggage.";
+          toast.error("Baggage not added", { description: message });
+        }
+      }
+
       setOpen(false);
       reset();
     } catch (err) {
@@ -150,6 +183,51 @@ export function CreateBookingDialog({ flights }: { flights?: Flight[] }) {
             </Select>
           </div>
 
+          <div className="space-y-3 rounded-md border border-border p-3">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-primary"
+                checked={addBaggage}
+                onChange={(e) => setAddBaggage(e.target.checked)}
+              />
+              Also add a baggage record (staff / admin)
+            </label>
+
+            {addBaggage && (
+              <div className="space-y-4">
+                <div className="space-y-1.5">
+                  <Label htmlFor="baggage-status">Baggage Status</Label>
+                  <Select
+                    value={baggageStatus}
+                    onValueChange={setBaggageStatus}
+                  >
+                    <SelectTrigger id="baggage-status">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {BAGGAGE_STATUSES.map((s) => (
+                        <SelectItem key={s} value={s}>
+                          {s}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label htmlFor="baggage-location">Baggage Location</Label>
+                  <Input
+                    id="baggage-location"
+                    placeholder="Heathrow Airport"
+                    value={baggageLocation}
+                    onChange={(e) => setBaggageLocation(e.target.value)}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
           <DialogFooter>
             <Button
               type="button"
@@ -162,13 +240,15 @@ export function CreateBookingDialog({ flights }: { flights?: Flight[] }) {
               type="submit"
               disabled={
                 createBooking.isPending ||
+                createBaggage.isPending ||
                 !flightId ||
                 flightId === "none" ||
                 name.trim().length < 2 ||
-                !email
+                !email ||
+                (addBaggage && !baggageLocation.trim())
               }
             >
-              {createBooking.isPending ? (
+              {createBooking.isPending || createBaggage.isPending ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" /> Creating…
                 </>
